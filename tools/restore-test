@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# restore-test: prove the latest backup restores, not just that it exists.
+# Restores a few small files that are always present from the latest snapshot
+# into a temp directory and compares them with the live system.
+# Installed as /usr/local/sbin/sol-restore-test; sol-check.service runs it weekly.
+#
+# Exit code: 0 all match, 1 a file changed since the backup, 2 restore failed.
+set -Euo pipefail
+
+ENV_FILE=${SOL_RESTIC_ENV:-/etc/sol/restic.env}
+BACKEND_FILE=/etc/sol/restic-backend.env
+FILES=(/etc/hostname /etc/fstab /etc/ssh/sshd_config)
+
+set -a
+# shellcheck source=/dev/null
+source "$ENV_FILE"
+# shellcheck source=/dev/null
+if [[ -r $BACKEND_FILE ]]; then source "$BACKEND_FILE"; fi
+set +a
+
+target=$(mktemp -d)
+trap 'rm -rf "$target"' EXIT
+
+includes=()
+for f in "${FILES[@]}"; do includes+=(--include "$f"); done
+
+start=$(date +%s%N)
+if ! restic restore latest --target "$target" "${includes[@]}" --quiet; then
+  echo "FAIL restic could not restore from the latest snapshot"
+  exit 2
+fi
+ms=$((($(date +%s%N) - start) / 1000000))
+
+rc=0
+for f in "${FILES[@]}"; do
+  if [[ ! -f $target$f ]]; then
+    echo "FAIL $f is missing from the latest snapshot"
+    rc=2
+  elif cmp -s "$f" "$target$f"; then
+    echo "ok   $f"
+  else
+    echo "warn $f differs from the live file (changed since the backup?)"
+    if ((rc == 0)); then rc=1; fi
+  fi
+done
+
+snapshot=$(restic snapshots latest --json | python3 -c 'import json, sys; s = json.load(sys.stdin)[0]; print(s["short_id"], s["time"][:19])')
+echo "restored ${#FILES[@]} files from snapshot $snapshot in $ms ms"
+exit $rc

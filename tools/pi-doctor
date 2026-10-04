@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# pi-doctor: one-screen health report for a Raspberry Pi. Runs on any Debian
+# box; Pi-only checks skip themselves elsewhere. Read-only, changes nothing.
+#
+#   pi-doctor            report
+#   pi-doctor --bench    also time a 256 MiB read from the boot device (root)
+#   pi-doctor --json     machine-readable, for monitoring
+#
+# Exit code: 0 all ok, 1 warnings, 2 failures. Run as root for the full report.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$ROOT/lib/common.sh"
+# shellcheck source=lib/pi.sh
+source "$ROOT/lib/pi.sh"
+
+JSON=0 BENCH=0
+for arg in "$@"; do
+  case $arg in
+    --json) JSON=1 ;;
+    --bench) BENCH=1 ;;
+    -h | --help) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) die "unknown option: $arg" ;;
+  esac
+done
+if ((JSON)); then C_DIM='' C_RED='' C_YEL='' C_GRN='' C_BLD='' C_OFF=''; fi
+
+R_STATUS=() R_SECTION=() R_NAME=() R_DETAIL=()
+SECTION=''
+KLOG=''
+
+section() {
+  SECTION=$1
+  if ((!JSON)); then printf '\n%s%s%s\n' "$C_BLD" "$1" "$C_OFF"; fi
+}
+
+# result STATUS NAME DETAIL, where STATUS is ok | warn | fail | info
+result() {
+  R_STATUS+=("$1") R_SECTION+=("$SECTION") R_NAME+=("$2") R_DETAIL+=("$3")
+  ((JSON)) && return 0
+  local color=$C_DIM
+  case $1 in ok) color=$C_GRN ;; warn) color=$C_YEL ;; fail) color=$C_RED ;; esac
+  printf '  %s%-5s%s %-15s %s\n' "$color" "$1" "$C_OFF" "$2" "$3"
+}
+
+# ---------------------------------------------------------------------------
+
+check_system() {
+  section system
+  result info model "$(pi_model)"
+  result info os "$(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME"), $(uname -m), kernel $(uname -r)"
+  result info uptime "$(uptime -p 2>/dev/null | sed 's/^up //')"
+  local load cores
+  read -r load _ </proc/loadavg
+  cores=$(nproc)
+  if awk -v l="$load" -v c="$cores" 'BEGIN { exit !(l > c) }'; then
+    result warn load "$load on $cores cores: more runnable work than CPUs"
+  else
+    result ok load "$load on $cores cores"
+  fi
+}
+
+check_power() {
+  section "power and heat"
+  local temp=''
+  if have vcgencmd && vcgencmd get_throttled >/dev/null 2>&1; then
+    local raw sev
+    raw=$(vcgencmd get_throttled)
+    sev=$(throttle_severity "$raw")
+    result "$sev" throttling "$(decode_throttled "$raw" | paste -sd ';' - | sed 's/;/; /g') (${raw#throttled=})"
+    if [[ $sev != ok ]]; then
+      result info hint "on a Pi 4 under-voltage means the supply or the cable: use the official 5.1 V 3 A one"
+    fi
+    temp=$(vcgencmd measure_temp | grep -o '[0-9.]*' | head -1)
+    result info clocks "ARM $(($(vcgencmd measure_clock arm | cut -d= -f2) / 1000000)) MHz, core $(vcgencmd measure_volts core | cut -d= -f2)"
+  else
+    result info throttling "vcgencmd not available: firmware checks skipped"
+  fi
+  if [[ -z $temp && -r /sys/class/thermal/thermal_zone0/temp ]]; then
+    temp=$(awk '{ printf "%.1f", $1 / 1000 }' /sys/class/thermal/thermal_zone0/temp)
+  fi
+  if [[ -n $temp ]]; then
+    if awk -v t="$temp" 'BEGIN { exit !(t >= 80) }'; then
+      result fail temperature "$temp °C: the Pi 4 throttles at 80 °C"
+    elif awk -v t="$temp" 'BEGIN { exit !(t >= 70) }'; then
+      result warn temperature "$temp °C: close to the 80 °C throttle point"
+    else
+      result ok temperature "$temp °C"
+    fi
+  fi
+}
+
+check_storage() {
+  section storage
+  local src transport size pct opts
+  src=$(findmnt -no SOURCE /)
+  transport=$(storage_transport "$src")
+  read -r size pct < <(df -B1 --output=size,pcent / | tail -1)
+  pct=${pct%\%}
+  local status=ok
+  if ((pct >= 95)); then status=fail; elif ((pct >= 80)); then status=warn; fi
+  result "$status" "root" "$src ($transport), $(human_bytes "$size"), ${pct}% used"
+
+  opts=$(findmnt -no OPTIONS /)
+  if [[ ,$opts, == *,noatime,* ]]; then
+    result ok "mount" "noatime"
+  elif [[ $transport == sd ]]; then
+    result warn "mount" "no noatime on an SD card: every file read is also a write"
+  else
+    result info "mount" "$opts"
+  fi
+
+  if [[ $transport == sd ]]; then
+    local dev=${src#/dev/}
+    local d=/sys/block/${dev%p[0-9]*}/device
+    if [[ -r $d/name ]]; then
+      result info card "$(<"$d/name"), manfid $(<"$d/manfid"), oemid $(<"$d/oemid"), made $(<"$d/date")"
+    fi
+  fi
+
+  if [[ -n $KLOG ]]; then
+    local errors
+    errors=$(grep -Eic 'I/O error|EXT4-fs error|mmc[0-9]+: .*(timeout|error)|blk_update_request' <<<"$KLOG" || true)
+    if ((errors > 0)); then
+      result fail "I/O errors" "$errors storage errors in the kernel log since boot"
+    else
+      result ok "I/O errors" "none in the kernel log since boot"
+    fi
+  else
+    result info "I/O errors" "kernel log not readable: run as root"
+  fi
+
+  if ((BENCH)); then bench_root "$src" "$transport"; fi
+}
+
+bench_root() {
+  local src=$1 transport=$2 disk=${1#/dev/}
+  case $disk in mmcblk* | nvme*) disk=${disk%p[0-9]*} ;; *) disk=${disk%%[0-9]*} ;; esac
+  if [[ ! -r /dev/$disk ]]; then
+    result info "read speed" "needs root to read /dev/$disk"
+    return
+  fi
+  local bytes=$((256 << 20)) start end mb verdict
+  start=$(date +%s%N)
+  if ! dd if="/dev/$disk" of=/dev/null bs=4M count=64 iflag=direct status=none 2>/dev/null; then
+    result fail "read speed" "read error on /dev/$disk"
+    return
+  fi
+  end=$(date +%s%N)
+  mb=$(mbps "$bytes" $((end - start)))
+  if [[ $transport == sd ]]; then
+    verdict=$(sd_read_verdict "$mb")
+    result "${verdict%%|*}" "read speed" "$mb MB/s from /dev/$disk: ${verdict#*|}"
+  else
+    result info "read speed" "$mb MB/s from /dev/$disk ($transport)"
+  fi
+}
+
+check_boot() {
+  section boot
+  if have systemd-analyze && systemd-analyze time >/dev/null 2>&1; then
+    local total secs slow
+    total=$(systemd-analyze time | sed -n 's/.*= \(.*\)$/\1/p' | head -1)
+    secs=$(awk '{ s = 0; for (i = 1; i <= NF; i++) { v = $i + 0; if ($i ~ /min$/) s += v * 60; else if ($i ~ /ms$/) s += v / 1000; else if ($i ~ /s$/) s += v } printf "%d", s }' <<<"$total")
+    slow=$(systemd-analyze blame --no-pager 2>/dev/null | head -3 | awk '{ printf "%s%s %s", (NR > 1 ? ", " : ""), $2, $1 }')
+    if ((secs > 90)); then
+      result warn "boot time" "$total (slowest: $slow)"
+    else
+      result ok "boot time" "$total (slowest: $slow)"
+    fi
+  else
+    result info "boot time" "systemd-analyze not available here"
+  fi
+  if have systemctl; then
+    local failed
+    failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{ print $1 }' | paste -sd, - | sed 's/,/, /g')
+    if [[ -n $failed ]]; then result fail "failed units" "$failed"; else result ok "failed units" "none"; fi
+  fi
+}
+
+check_memory() {
+  section memory
+  local total avail swap_total swap_free pct
+  total=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+  avail=$(awk '/^MemAvailable:/ { print $2 }' /proc/meminfo)
+  swap_total=$(awk '/^SwapTotal:/ { print $2 }' /proc/meminfo)
+  swap_free=$(awk '/^SwapFree:/ { print $2 }' /proc/meminfo)
+  pct=$((avail * 100 / total))
+  local status=ok
+  if ((pct < 5)); then status=fail; elif ((pct < 15)); then status=warn; fi
+  result "$status" "available" "$((avail / 1024)) of $((total / 1024)) MiB (${pct}%)"
+  if ((swap_total > 0)); then
+    result info "swap" "$(((swap_total - swap_free) / 1024)) of $((swap_total / 1024)) MiB used"
+  fi
+  if [[ -n $KLOG ]]; then
+    local ooms
+    ooms=$(grep -c 'Out of memory: Killed process' <<<"$KLOG" || true)
+    if ((ooms > 0)); then result warn "OOM kills" "$ooms since boot"; else result ok "OOM kills" "none since boot"; fi
+  fi
+}
+
+check_network() {
+  section network
+  local route
+  route=$(ip route show default 2>/dev/null | head -1)
+  if [[ -n $route ]]; then
+    result ok "default route" "$(awk '{ for (i = 1; i < NF; i++) if ($i == "dev") print "via " $(i + 1) }' <<<"$route")"
+  else
+    result fail "default route" "none: not connected to any network"
+  fi
+
+  if have rfkill && rfkill list wifi 2>/dev/null | grep -q 'Soft blocked: yes'; then
+    result fail "wifi radio" "soft-blocked: set the Wi-Fi country (raspi-config nonint do_wifi_country XX)"
+  fi
+  if have nmcli; then
+    local wifi
+    wifi=$(nmcli -t -f IN-USE,SSID,SIGNAL device wifi list --rescan no 2>/dev/null | awk -F: '$1 == "*" { print $2 " (signal " $3 "%)"; exit }')
+    if [[ -n $wifi ]]; then result info "wifi" "$wifi"; fi
+  fi
+
+  if getent hosts deb.debian.org >/dev/null 2>&1; then result ok "dns" "resolves"; else result fail "dns" "deb.debian.org does not resolve"; fi
+  case $(internet_status) in
+    online) result ok "internet" "generate_204 answered 204" ;;
+    captive) result warn "internet" "HTTP is intercepted: captive portal" ;;
+    *) result fail "internet" "unreachable" ;;
+  esac
+
+  if have systemctl && systemctl is-active --quiet avahi-daemon 2>/dev/null; then
+    result ok "mdns" "$(hostname).local is announced"
+  else
+    result info "mdns" "avahi-daemon not running"
+  fi
+  if have tailscale; then
+    local state
+    state=$(tailscale status --json 2>/dev/null | python3 -c 'import json, sys; print(json.load(sys.stdin).get("BackendState", ""))' 2>/dev/null)
+    if [[ $state == Running ]]; then result ok "tailscale" "on the tailnet"; else result warn "tailscale" "${state:-not running}"; fi
+  else
+    result info "tailscale" "not installed"
+  fi
+}
+
+check_security() {
+  section security
+  if ((EUID == 0)) && have sshd; then
+    local cfg pw root
+    cfg=$(sshd -T 2>/dev/null)
+    pw=$(awk '$1 == "passwordauthentication" { print $2 }' <<<"$cfg")
+    root=$(awk '$1 == "permitrootlogin" { print $2 }' <<<"$cfg")
+    if [[ $pw == no ]]; then result ok "ssh passwords" "off"; else result warn "ssh passwords" "password logins allowed"; fi
+    case $root in
+      no) result ok "ssh root" "no root login" ;;
+      prohibit-password | without-password) result info "ssh root" "root with a key only" ;;
+      *) result warn "ssh root" "root can log in with a password" ;;
+    esac
+  else
+    result info "ssh" "run as root to read the effective sshd config"
+  fi
+  if ((EUID == 0)) && have nft; then
+    if nft list table inet sol >/dev/null 2>&1; then result ok "firewall" "table inet sol loaded"; else result warn "firewall" "sol ruleset not loaded"; fi
+  fi
+  if have apt-get; then
+    local pending
+    pending=$(apt-get -s -o Debug::NoLocking=1 upgrade 2>/dev/null | grep -c '^Inst' || true)
+    if ((pending > 0)); then result warn "updates" "$pending package(s) can be upgraded"; else result ok "updates" "nothing pending"; fi
+  fi
+  if [[ -f /run/reboot-required || -s /run/sol-reboot-required ]]; then
+    result warn "reboot" "pending: $(cat /run/reboot-required.pkgs /run/sol-reboot-required 2>/dev/null | sort -u | paste -sd, - | sed 's/,/, /g')"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  s=${s//$'\t'/\\t}
+  s=${s//$'\n'/\\n}
+  s=${s//$'\r'/}
+  printf '%s' "$s"
+}
+
+main() {
+  KLOG=$(journalctl -k -b --no-pager -q 2>/dev/null || true)
+  [[ -n $KLOG ]] || KLOG=$(dmesg 2>/dev/null || true)
+
+  if ((!JSON)); then printf '%spi-doctor%s  %s  %s\n' "$C_BLD" "$C_OFF" "$(hostname)" "$(date '+%Y-%m-%d %H:%M')"; fi
+  check_system
+  check_power
+  check_storage
+  check_boot
+  check_memory
+  check_network
+  check_security
+
+  local s n_ok=0 n_warn=0 n_fail=0
+  for s in "${R_STATUS[@]}"; do
+    case $s in ok) n_ok=$((n_ok + 1)) ;; warn) n_warn=$((n_warn + 1)) ;; fail) n_fail=$((n_fail + 1)) ;; esac
+  done
+
+  if ((JSON)); then
+    printf '{"host":"%s","time":"%s","summary":{"ok":%d,"warn":%d,"fail":%d},"checks":[' \
+      "$(json_escape "$(hostname)")" "$(date -Is)" "$n_ok" "$n_warn" "$n_fail"
+    local i
+    for i in "${!R_STATUS[@]}"; do
+      ((i > 0)) && printf ','
+      printf '{"section":"%s","check":"%s","status":"%s","detail":"%s"}' \
+        "$(json_escape "${R_SECTION[i]}")" "$(json_escape "${R_NAME[i]}")" "${R_STATUS[i]}" "$(json_escape "${R_DETAIL[i]}")"
+    done
+    printf ']}\n'
+  else
+    printf '\n%s%d ok, %d warning(s), %d failure(s)%s\n' "$C_BLD" "$n_ok" "$n_warn" "$n_fail" "$C_OFF"
+  fi
+
+  if ((n_fail > 0)); then return 2; elif ((n_warn > 0)); then return 1; fi
+  return 0
+}
+
+main

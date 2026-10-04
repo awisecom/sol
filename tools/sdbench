@@ -1,0 +1,158 @@
+#!/usr/bin/env bash
+# sdbench: measure what a storage device really does instead of trusting its label.
+#
+#   sdbench /dev/mmcblk0                sequential read (1 GiB) + random 4k read (needs fio)
+#   sdbench --size 256M /dev/sda        shorter run
+#   sdbench --write /mnt/usb /dev/sda   also sequential write, via a temp file in that directory
+#   sdbench --scan /dev/sdb             read the whole device chunk by chunk: speed per chunk
+#                                       and every read error (--chunk 1G by default)
+#
+# Reads are read-only and bypass the page cache (O_DIRECT) where the device allows.
+# --write creates one temporary file and deletes it. Block devices need root.
+set -Euo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=lib/common.sh
+source "$ROOT/lib/common.sh"
+# shellcheck source=lib/pi.sh
+source "$ROOT/lib/pi.sh"
+
+usage() { sed -n '2,12p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+SIZE=1G CHUNK=1G SCAN=0 WRITE_DIR=''
+while (($#)); do
+  case $1 in
+    --size) SIZE=${2:?}; shift ;;
+    --chunk) CHUNK=${2:?}; shift ;;
+    --scan) SCAN=1 ;;
+    --write) WRITE_DIR=${2:?}; shift ;;
+    -h | --help) usage; exit 0 ;;
+    -*) die "unknown option: $1" ;;
+    *) break ;;
+  esac
+  shift
+done
+TARGET=${1:-}
+[[ -n $TARGET ]] || { usage; exit 1; }
+[[ -e $TARGET ]] || die "$TARGET does not exist"
+[[ -r $TARGET ]] || die "cannot read $TARGET (block devices need root)"
+
+SIZE_B=$(to_bytes "$SIZE") || exit 1
+CHUNK_B=$(to_bytes "$CHUNK") || exit 1
+MIB=$((1 << 20))
+((CHUNK_B % MIB == 0)) || die "--chunk must be a whole number of MiB"
+if [[ -b $TARGET ]]; then TOTAL=$(blockdev --getsize64 "$TARGET"); else TOTAL=$(stat -c %s "$TARGET"); fi
+((TOTAL > 0)) || die "$TARGET is empty"
+
+ERRLOG=$(mktemp)
+TMPFILE=''
+cleanup() { rm -f "$ERRLOG" ${TMPFILE:+"$TMPFILE"}; }
+trap cleanup EXIT
+
+# O_DIRECT keeps the page cache out of the numbers. tmpfs and some filesystems
+# refuse it; then results for a regular file can be cache-inflated.
+DIRECT=(iflag=direct)
+if ! dd if="$TARGET" of=/dev/null bs=4096 count=1 iflag=direct status=none 2>/dev/null; then
+  DIRECT=()
+  warn "O_DIRECT not supported on $TARGET: numbers may include page-cache hits"
+fi
+
+now_ns() { date +%s%N; }
+
+# read_range OFFSET LENGTH: read LENGTH bytes at OFFSET (both MiB aligned), print nanoseconds.
+read_range() {
+  local off=$1 len=$2 start end
+  start=$(now_ns)
+  dd if="$TARGET" of=/dev/null bs=1M skip=$((off / MIB)) count=$(((len + MIB - 1) / MIB)) \
+    "${DIRECT[@]}" status=none 2>"$ERRLOG" || return 1
+  end=$(now_ns)
+  echo $((end - start))
+}
+
+# short_size BYTES: 1073741824 -> 1G, 3145728 -> 3M
+short_size() {
+  local b=$1
+  if ((b == 0)); then echo 0
+  elif ((b % (1 << 30) == 0)); then echo "$((b >> 30))G"
+  elif ((b % MIB == 0)); then echo "$((b / MIB))M"
+  else echo "${b}B"
+  fi
+}
+
+seconds() { awk -v ns="$1" 'BEGIN { printf "%.1f", ns / 1e9 }'; }
+
+verdict_line() {
+  local mb=$1 v
+  case $(storage_transport "$TARGET") in
+    sd) v=$(sd_read_verdict "$mb"); printf 'verdict          %s: %s\n' "${v%%|*}" "${v#*|}" ;;
+  esac
+}
+
+scan() {
+  local off len ns sum_ns=0 sum_b=0 errors=0 stop=0
+  trap 'stop=1' INT
+  printf '%-15s %8s  %s\n' range MB/s status
+  for ((off = 0; off < TOTAL; off += CHUNK_B)); do
+    ((stop)) && break
+    len=$((TOTAL - off < CHUNK_B ? TOTAL - off : CHUNK_B))
+    if ns=$(read_range "$off" "$len"); then
+      printf '%-15s %8s  ok\n' "$(short_size "$off")-$(short_size $((off + len)))" "$(mbps "$len" "$ns")"
+      sum_ns=$((sum_ns + ns)) sum_b=$((sum_b + len))
+    else
+      printf '%-15s %8s  READ ERROR: %s\n' "$(short_size "$off")-$(short_size $((off + len)))" - "$(head -1 "$ERRLOG")"
+      errors=$((errors + 1))
+    fi
+  done
+  trap - INT
+  echo
+  if ((stop)); then echo "interrupted"; fi
+  printf 'read %s in %s s: %s MB/s average, %d read error(s)\n' \
+    "$(human_bytes "$sum_b")" "$(seconds "$sum_ns")" "$(mbps "$sum_b" "$sum_ns")" "$errors"
+  verdict_line "$(mbps "$sum_b" "$sum_ns")"
+  ((errors == 0))
+}
+
+sequential_read() {
+  local len=$((SIZE_B < TOTAL ? SIZE_B : TOTAL)) ns mb
+  ns=$(read_range 0 "$len") || die "read error: $(head -1 "$ERRLOG")"
+  mb=$(mbps "$len" "$ns")
+  printf 'sequential read  %7s MB/s   (%s in %s s)\n' "$mb" "$(human_bytes "$len")" "$(seconds "$ns")"
+  verdict_line "$mb"
+}
+
+random_read() {
+  if ! have fio; then
+    echo "random 4k read   skipped (apt install fio)"
+    return 0
+  fi
+  local direct=1 out iops
+  ((${#DIRECT[@]})) || direct=0
+  out=$(fio --name=sdbench --filename="$TARGET" --readonly --rw=randread --bs=4k --direct="$direct" \
+    --ioengine=psync --size="$((SIZE_B < TOTAL ? SIZE_B : TOTAL))" --runtime=10 --time_based \
+    --output-format=json 2>/dev/null) || { echo "random 4k read   fio failed"; return 0; }
+  iops=$(python3 -c 'import json, sys; print(int(json.load(sys.stdin)["jobs"][0]["read"]["iops"]))' <<<"$out")
+  printf 'random 4k read   %7s IOPS   (%s)\n' "$iops" "$(iops_class "$iops")"
+}
+
+sequential_write() {
+  [[ -d $WRITE_DIR && -w $WRITE_DIR ]] || die "--write needs a writable directory"
+  TMPFILE=$WRITE_DIR/.sdbench.$$
+  local len=$SIZE_B start end
+  start=$(now_ns)
+  if ! dd if=/dev/zero of="$TMPFILE" bs=1M count=$((len / MIB)) oflag=direct conv=fsync status=none 2>/dev/null; then
+    dd if=/dev/zero of="$TMPFILE" bs=1M count=$((len / MIB)) conv=fsync status=none || die "write failed in $WRITE_DIR"
+  fi
+  end=$(now_ns)
+  rm -f "$TMPFILE"
+  TMPFILE=''
+  printf 'sequential write %7s MB/s   (%s in %s s, synced)\n' "$(mbps "$len" $((end - start)))" "$(human_bytes "$len")" "$(seconds $((end - start)))"
+}
+
+printf 'sdbench %s (%s, %s)\n\n' "$TARGET" "$(human_bytes "$TOTAL")" "$(storage_transport "$TARGET")"
+if ((SCAN)); then
+  scan
+  exit $?
+fi
+sequential_read
+random_read
+if [[ -n $WRITE_DIR ]]; then sequential_write; fi
