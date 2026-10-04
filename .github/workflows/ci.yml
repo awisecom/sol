@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats and shellcheck
+        run: sudo apt-get update -q && sudo apt-get install -y -q bats shellcheck
+
+      - name: shellcheck
+        run: make lint
+
+      - name: bats
+        run: make test
+
+      - name: Full dry run (x86 runner, so the Pi-only steps skip themselves)
+        run: make dry-run
+
+      - name: pi-doctor on the runner
+        run: bash tools/pi-doctor || [ $? -le 2 ]
