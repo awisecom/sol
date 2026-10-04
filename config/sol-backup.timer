@@ -1,0 +1,12 @@
+# Installed by sol (steps/95-backup.sh).
+[Unit]
+Description=sol: nightly restic backup
+
+[Timer]
+OnCalendar=*-*-* 03:15
+RandomizedDelaySec=30m
+# Catch up after the box was off at 03:15.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

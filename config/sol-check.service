@@ -1,0 +1,16 @@
+# Installed by sol (steps/95-backup.sh).
+# A backup is only real once something has been restored from it.
+[Unit]
+Description=sol: restic integrity check and restore test
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sol/restic.env
+EnvironmentFile=-/etc/sol/restic-backend.env
+# %% is a literal % in unit files: read back 5% of the stored data each week.
+ExecStart=/usr/bin/restic check --read-data-subset=5%%
+ExecStartPost=/usr/local/sbin/sol-restore-test
+Nice=10
+IOSchedulingClass=idle

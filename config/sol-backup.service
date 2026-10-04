@@ -1,0 +1,14 @@
+# Installed by sol (steps/95-backup.sh).
+[Unit]
+Description=sol: restic backup
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/sol/restic.env
+EnvironmentFile=-/etc/sol/restic-backend.env
+ExecStart=/usr/bin/restic backup --one-file-system --exclude-caches --exclude=/home/*/.cache --tag nightly @SOL_BACKUP_PATHS@
+ExecStartPost=/usr/bin/restic forget --prune --tag nightly --keep-daily 7 --keep-weekly 4 --keep-monthly 6
+Nice=10
+IOSchedulingClass=idle

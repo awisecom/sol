@@ -1,0 +1,22 @@
+# Installed by sol (steps/60-network.sh) from SOL_WIFI_NETWORKS.
+[connection]
+id=@SOL_WIFI_SSID@
+uuid=@SOL_WIFI_UUID@
+type=wifi
+autoconnect=true
+autoconnect-priority=@SOL_WIFI_PRIO@
+
+[wifi]
+mode=infrastructure
+ssid=@SOL_WIFI_SSID@
+
+[wifi-security]
+key-mgmt=wpa-psk
+psk=@SOL_WIFI_PSK@
+
+[ipv4]
+method=auto
+
+[ipv6]
+method=auto
+addr-gen-mode=stable-privacy

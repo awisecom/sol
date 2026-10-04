@@ -1,0 +1,16 @@
+# Installed by sol (steps/70-usb-gadget.sh).
+# The Pi takes 10.42.0.1 on usb0 and hands the laptop on the cable an address.
+[connection]
+id=usb-gadget
+uuid=@SOL_GADGET_UUID@
+type=ethernet
+interface-name=usb0
+autoconnect=true
+
+[ethernet]
+
+[ipv4]
+method=shared
+
+[ipv6]
+method=link-local
